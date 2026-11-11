@@ -1,325 +1,562 @@
 <?php
+// เริ่มต้นเซสชัน
 session_start();
+
+// ดึงไฟล์เชื่อมต่อฐานข้อมูล
 include 'config.php';
+
+// ตรวจสอบว่าผู้ใช้ล็อกอินอยู่หรือไม่ ถ้ายังไม่ล็อกอินให้กลับไปหน้า login
 if (!isset($_SESSION['company_id'])) {
-    header('location:login.php');
-    exit();
-}
-$cid = $_SESSION['company_id'];
-
-// ต้องมีแพ็กเกจที่ใช้งานอยู่
-$has_pack = mysqli_num_rows(mysqli_query($conn, "select * from members where company_id=$cid and status_mem='Y' and (end_mem is null or end_mem >= curdate())"));
-if($has_pack == 0){
-    header('location: package.php');
+    header('location: login.php');
     exit();
 }
 
-// ค่าตั้งค่าระบบ
-$set = [];
-$r = mysqli_query($conn, "select * from eco_setting");
-while($s = mysqli_fetch_assoc($r)) $set[$s['setting_key']] = $s['setting_value'];
-$ppk = $set['point_per_kg'] ?? 10;
+$cid = (int)$_SESSION['company_id'];
 
-// ชื่อ, หน่วย, factor, ราคาตั้งต้น, ชื่อสลิป
-$types = [
-    'elec'  => ['⚡ ไฟฟ้า', 'kWh', $set['factor_elec'] ?? 0.4999, 4.5, 'ค่าไฟ'],
-    'water' => ['💧 น้ำ', 'ลบ.ม.', $set['factor_water'] ?? 0.7, 18, 'ค่าน้ำ'],
-];
+// 1. ตรวจสอบว่ามีแพ็กเกจที่ใช้งานได้อยู่หรือไม่
+$sql_check_pack = "SELECT * FROM members WHERE company_id = $cid AND status_mem = 'Y' AND (end_mem IS NULL OR end_mem >= CURDATE())";
+$pack_query = mysqli_query($conn, $sql_check_pack);
+$has_pack = mysqli_num_rows($pack_query);
 
-// ดึงบันทึกของบริษัทเราทั้งหมด แล้วคำนวณใน PHP
-$all = [];
-$rejected = [];
-$rej_months = [];   // หมวด => เดือนที่ถูกปฏิเสธ
-$r = mysqli_query($conn, "select * from utility_logs where company_id=$cid order by record_date, id");
-while($x = mysqli_fetch_assoc($r)){
-    $all[] = $x;
-    if($x['review_status'] == 'R'){
-        $rejected[] = $x;
-        $rej_months[$x['type']][date('Y-m', strtotime($x['record_date']))] = 1;
+if ($has_pack == 0) {
+    header('location: pack.php');
+    exit();
+}
+
+// 2. ดึงค่าตั้งค่าระบบจากตาราง eco_setting
+$settings = array();
+$sql_settings = "SELECT * FROM eco_setting";
+$query_settings = mysqli_query($conn, $sql_settings);
+
+while ($s_row = mysqli_fetch_assoc($query_settings)) {
+    $settings[$s_row['setting_key']] = $s_row['setting_value'];
+}
+
+if (isset($settings['point_per_kg'])) {
+    $point_per_kg = (float)$settings['point_per_kg'];
+} else {
+    $point_per_kg = 10;
+}
+
+if (isset($settings['factor_elec'])) {
+    $factor_elec = (float)$settings['factor_elec'];
+} else {
+    $factor_elec = 0.4999;
+}
+
+if (isset($settings['factor_water'])) {
+    $factor_water = (float)$settings['factor_water'];
+} else {
+    $factor_water = 0.7;
+}
+
+// กำหนดรายละเอียดของแต่ละประเภท (ชื่อ, หน่วย, factor, ราคาต่อหน่วยตั้งต้น, คำเรียกภาษาไทย)
+$types = array(
+    'elec'  => array('name' => '⚡ ไฟฟ้า', 'unit' => 'kWh',   'factor' => $factor_elec,  'default_price' => 4.5, 'title' => 'ค่าไฟ'),
+    'water' => array('name' => '💧 น้ำ',   'unit' => 'ลบ.ม.', 'factor' => $factor_water, 'default_price' => 18,  'title' => 'ค่าน้ำ')
+);
+
+// 3. ดึงบันทึกการใช้พลังงานของบริษัทเราทั้งหมด
+$all_logs = array();
+$rejected_logs = array();
+$rejected_months = array();
+
+$sql_my_logs = "SELECT * FROM utility_logs WHERE company_id = $cid ORDER BY record_date ASC, id ASC";
+$query_my_logs = mysqli_query($conn, $sql_my_logs);
+
+while ($row = mysqli_fetch_assoc($query_my_logs)) {
+    $all_logs[] = $row;
+    if ($row['review_status'] == 'R') {
+        $rejected_logs[] = $row;
+        $row_type = $row['type'];
+        $row_month = date('Y-m', strtotime($row['record_date']));
+        $rejected_months[$row_type][$row_month] = 1;
     }
 }
 
-// เดือนที่ให้กรอกใหม่ แยกตามหมวด (ถ้าไม่มีที่ถูกปฏิเสธ ใช้เดือนปัจจุบัน)
-foreach($types as $t => $info) $redo[$t] = date('Y-m');
-foreach(array_reverse($rejected) as $x) $redo[$x['type']] = date('Y-m', strtotime($x['record_date']));
+// กำหนดเดือนที่ให้กรอกใหม่สำหรับแต่ละหมวด
+$redo_month = array();
+foreach ($types as $t_key => $t_info) {
+    $redo_month[$t_key] = date('Y-m');
+}
+$reversed_rejected = array_reverse($rejected_logs);
+foreach ($reversed_rejected as $rej_item) {
+    $rej_type = $rej_item['type'];
+    $redo_month[$rej_type] = date('Y-m', strtotime($rej_item['record_date']));
+}
 
-// ข้อมูลที่ใช้ได้ (ตัดเดือนที่ถูกปฏิเสธ) + ค่าล่าสุดแต่ละหมวด
-$has_prev = [];      // หมวด => เคยบันทึกแล้ว
-$last = [];          // หมวด => แถวล่าสุด
-$tot_prev = 0;       // สรุป 1 ปี
-$tot_now = 0;
-$year_months = [];   // เดือนที่บันทึกใน 1 ปี
-$one_year_ago = date('Y-m-d', strtotime('-12 month'));
-foreach($all as $x){
-    $m = date('Y-m', strtotime($x['record_date']));
-    if(isset($rej_months[$x['type']][$m])) continue;
-    $has_prev[$x['type']] = true;
-    $last[$x['type']] = $x;   // เรียงเก่า->ใหม่ ตัวสุดท้ายจะเป็นล่าสุด
-    if($x['record_date'] > $one_year_ago){
-        $tot_now += $x['amount'] * $types[$x['type']][2];
-        $tot_prev += $x['prev_amount'] * $types[$x['type']][2];
-        $year_months[$m] = 1;
+// ประมวลผลข้อมูลที่ใช้ได้ (ไม่รวมเดือนที่ถูกปฏิเสธ) เพื่อหาค่าล่าสุด และสถิติย้อนหลัง 1 ปี
+$has_previous_record = array();
+$last_record_by_type = array();
+$total_previous_carbon = 0;
+$total_current_carbon = 0;
+$year_recorded_months = array();
+$one_year_ago_date = date('Y-m-d', strtotime('-12 month'));
+
+foreach ($all_logs as $log_item) {
+    $log_type = $log_item['type'];
+    $log_month = date('Y-m', strtotime($log_item['record_date']));
+
+    // ข้ามรายการที่อยู่ในเดือนที่ถูกปฏิเสธ
+    if (isset($rejected_months[$log_type][$log_month])) {
+        continue;
+    }
+
+    $has_previous_record[$log_type] = true;
+    $last_record_by_type[$log_type] = $log_item;
+
+    if ($log_item['record_date'] > $one_year_ago_date) {
+        $type_factor = $types[$log_type]['factor'];
+        $current_amount = (float)$log_item['amount'];
+        $prev_amount = (float)$log_item['prev_amount'];
+
+        $total_current_carbon = $total_current_carbon + ($current_amount * $type_factor);
+        $total_previous_carbon = $total_previous_carbon + ($prev_amount * $type_factor);
+        $year_recorded_months[$log_month] = 1;
     }
 }
 
-// ค่าตั้งต้นในฟอร์ม
-foreach($types as $t => $info){
-    $l = $last[$t] ?? null;
-    $def[$t] = ['start' => $l['meter_read'] ?? 0, 'prev' => $l['amount'] ?? 0, 'price' => $l['unit_price'] ?? $info[3]];
+// กำหนดค่าตั้งต้นในฟอร์มของแต่ละประเภท
+$form_defaults = array();
+foreach ($types as $t_key => $t_info) {
+    if (isset($last_record_by_type[$t_key])) {
+        $last_rec = $last_record_by_type[$t_key];
+        $form_defaults[$t_key] = array(
+            'start' => $last_rec['meter_read'],
+            'prev'  => $last_rec['amount'],
+            'price' => $last_rec['unit_price']
+        );
+    } else {
+        $form_defaults[$t_key] = array(
+            'start' => 0,
+            'prev'  => 0,
+            'price' => $t_info['default_price']
+        );
+    }
 }
 
-// ขอใบรับรอง
-$percent = $tot_prev > 0 ? ($tot_prev - $tot_now) / $tot_prev * 100 : 0;
-$months = count($year_months);
-$can_cert = $percent >= 10 && $months >= 10;
+// 4. ตรวจสอบเงื่อนไขการขอรับใบรับรองลดคาร์บอน (ลดได้ >= 10% และบันทึก >= 10 เดือน)
+if ($total_previous_carbon > 0) {
+    $reduction_percent = (($total_previous_carbon - $total_current_carbon) / $total_previous_carbon) * 100;
+} else {
+    $reduction_percent = 0;
+}
+$recorded_months_count = count($year_recorded_months);
+$can_request_certificate = ($reduction_percent >= 10 && $recorded_months_count >= 10);
 
-$company = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id=$cid"));
-$cname = $company['name'];
-$asked = false;
-$r = mysqli_query($conn, "select * from noti where type='cert'");
-while($n = mysqli_fetch_assoc($r)){
-    if(strpos($n['message'], $cname) !== false && $n['create_at'] >= date('Y-m-d H:i:s', strtotime('-30 day'))) $asked = true;
+// ตรวจสอบว่าเคยส่งคำขอใบรับรองไปแล้วในช่วง 30 วันที่ผ่านมาหรือไม่
+$sql_company_info = "SELECT * FROM company WHERE id = $cid";
+$company_query = mysqli_query($conn, $sql_company_info);
+$company_info = mysqli_fetch_assoc($company_query);
+$company_name = $company_info ? $company_info['name'] : '';
+
+$already_requested_cert = false;
+$thirty_days_ago = date('Y-m-d H:i:s', strtotime('-30 day'));
+$sql_check_cert_noti = "SELECT * FROM noti WHERE type = 'cert' AND create_at >= '$thirty_days_ago'";
+$query_cert_noti = mysqli_query($conn, $sql_check_cert_noti);
+
+while ($noti_row = mysqli_fetch_assoc($query_cert_noti)) {
+    if (strpos($noti_row['message'], $company_name) !== false) {
+        $already_requested_cert = true;
+    }
 }
 
-$errors = [];
-if($_SERVER['REQUEST_METHOD'] === 'POST'){
+// 5. จัดการเมื่อผู้ใช้กดส่งฟอร์ม (ขอรับใบรับรอง หรือ บันทึกข้อมูลค่าน้ำ-ค่าไฟ)
+$error_messages = array();
 
-    // ขอใบรับรอง
-    if(isset($_POST['request_cert'])){
-        if($can_cert){
-            mysqli_query($conn, "update members set cert_status='N', cert_date_req=curdate() where company_id=$cid");
-            $text = "องค์กร '$cname' ยื่นคำขอรับใบรับรอง (ลดคาร์บอนได้ " . number_format($percent, 1) . "% บันทึกครบ $months เดือน)";
-            $admins = mysqli_query($conn, "select * from company where role_id=1");
-            while($ad = mysqli_fetch_assoc($admins)){
-                mysqli_query($conn, "insert into noti(recip_id,message,type,link) values({$ad['id']},'$text','cert','admin/certificate.php')");
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // กรณีที่ 1: กดปุ่มขอรับใบรับรอง
+    if (isset($_POST['request_cert'])) {
+        if ($can_request_certificate) {
+            $sql_update_cert = "UPDATE members SET cert_status = 'N', cert_date_req = CURDATE() WHERE company_id = $cid";
+            mysqli_query($conn, $sql_update_cert);
+
+            $percent_display = number_format($reduction_percent, 1);
+            $cert_msg = "องค์กร '$company_name' ยื่นคำขอรับใบรับรอง (ลดคาร์บอนได้ $percent_display% บันทึกครบ $recorded_months_count เดือน)";
+            $escaped_cert_msg = mysqli_real_escape_string($conn, $cert_msg);
+
+            $sql_admins = "SELECT * FROM company WHERE role_id = 1";
+            $admins_query = mysqli_query($conn, $sql_admins);
+            while ($admin = mysqli_fetch_assoc($admins_query)) {
+                $admin_id = (int)$admin['id'];
+                $sql_insert_noti = "INSERT INTO noti (recip_id, message, type, link, create_at) VALUES ($admin_id, '$escaped_cert_msg', 'cert', 'admin/certificate_review.php', NOW())";
+                mysqli_query($conn, $sql_insert_noti);
             }
-            $_SESSION['msg'] = ['success', 'ส่งคำขอรับใบรับรองเรียบร้อยแล้ว'];
-        }else{
-            $_SESSION['msg'] = ['danger', 'ยังไม่ถึงเกณฑ์ (ลดคาร์บอน ' . number_format($percent, 1) . '% จาก 10% | บันทึก ' . $months . '/10 เดือน)'];
+
+            $_SESSION['flash_type'] = 'success';
+            $_SESSION['flash_text'] = 'ส่งคำขอรับใบรับรองเรียบร้อยแล้ว';
+        } else {
+            $_SESSION['flash_type'] = 'danger';
+            $_SESSION['flash_text'] = 'ยังไม่ถึงเกณฑ์ที่กำหนด (ลดคาร์บอน ' . number_format($reduction_percent, 1) . '% จาก 10% | บันทึก ' . $recorded_months_count . '/10 เดือน)';
         }
         header('location: utility.php');
         exit();
     }
 
-    // บันทึกรายเดือน (แยกหมวด)
-    $t = $_POST['rec_type'];
-    if(!isset($types[$t])) exit();
-    $info = $types[$t];
-    $month = $_POST['record_month'];
-    $note = $_POST['note'];
-    $mt = date('m/Y', strtotime("$month-01"));
-    $hp = isset($has_prev[$t]);
-
-    // เช็คเดือนนี้ของหมวดนี้ว่าเคยบันทึก / เคยถูกปฏิเสธไหม
-    $has_reject = isset($rej_months[$t][$month]);
-    $dup = false;
-    foreach($all as $x){
-        if($x['type'] == $t && date('Y-m', strtotime($x['record_date'])) == $month) $dup = true;
+    // กรณีที่ 2: บันทึกข้อมูลค่าน้ำ หรือ ค่าไฟ
+    $rec_type = $_POST['rec_type'];
+    if (!isset($types[$rec_type])) {
+        exit();
     }
 
-    if($month > date('Y-m')) $errors[] = 'ไม่สามารถบันทึกเดือนในอนาคตได้';
-    elseif(!$has_reject && $dup) $errors[] = "คุณบันทึกข้อมูล{$info[4]}ประจำเดือน $mt ไปแล้ว";
+    $type_info = $types[$rec_type];
+    $record_month = $_POST['record_month'];
+    $note = isset($_POST['note']) ? trim($_POST['note']) : '';
+    $month_display = date('m/Y', strtotime($record_month . '-01'));
+    $has_prev = isset($has_previous_record[$rec_type]);
 
-    $start = $hp ? $def[$t]['start'] : $_POST["start_$t"];
-    $prev = $hp ? $def[$t]['prev'] : $_POST["prev_$t"];
-    $end = $_POST["end_$t"];
-    $price = $_POST["price_$t"];
-    if($end < $start) $errors[] = "มิเตอร์{$info[0]}ปลายเดือนต้องไม่น้อยกว่าต้นเดือน";
-    $used = $end - $start;
-    $baht = ($prev - $used) * $price;
-    $d = [$start, $end, $price, $prev, $used, $used * $price, $baht, ($prev - $used) * $info[2]];
-    $tn = $used * $info[2];
-    $tp = $prev * $info[2];
-    $tb = $baht;
-
-    if(!$errors){
-        $reason = "ลดการใช้{$info[4]}ประจำเดือน $mt";
-
-        // เดือนที่ถูกปฏิเสธ: คืนแต้มเก่า + ลบข้อมูลเก่า (เฉพาะหมวดนี้)
-        if($has_reject){
-            $old = 0;
-            $pr = mysqli_query($conn, "select * from eco_point_ledger where company_id=$cid");
-            while($p = mysqli_fetch_assoc($pr)){
-                if($p['reason'] == $reason) $old += $p['point'];
+    // ตรวจสอบบันทึกซ้ำ หรือบันทึกเดือนที่ถูกปฏิเสธ
+    $is_rejected_month = isset($rejected_months[$rec_type][$record_month]);
+    $is_duplicate = false;
+    foreach ($all_logs as $existing_log) {
+        if ($existing_log['type'] == $rec_type) {
+            $existing_month = date('Y-m', strtotime($existing_log['record_date']));
+            if ($existing_month == $record_month) {
+                $is_duplicate = true;
             }
-            $neg = -$old;
-            if($neg != 0) mysqli_query($conn, "insert into eco_point_ledger(company_id,point,reason) values($cid,$neg,'$reason')");
-            foreach($all as $x){
-                if($x['type'] == $t && date('Y-m', strtotime($x['record_date'])) == $month){
-                    mysqli_query($conn, "delete from utility_logs where id={$x['id']}");
+        }
+    }
+
+    if ($record_month > date('Y-m')) {
+        $error_messages[] = 'ไม่สามารถบันทึกข้อมูลของเดือนในอนาคตได้';
+    } else if (!$is_rejected_month && $is_duplicate) {
+        $error_messages[] = 'คุณได้บันทึกข้อมูล' . $type_info['title'] . 'ประจำเดือน ' . $month_display . ' ไปเรียบร้อยแล้ว';
+    }
+
+    // รับค่าตัวเลขมิเตอร์
+    if ($has_prev) {
+        $meter_start = (float)$form_defaults[$rec_type]['start'];
+        $prev_amount = (float)$form_defaults[$rec_type]['prev'];
+    } else {
+        $meter_start = (float)$_POST['start_' . $rec_type];
+        $prev_amount = (float)$_POST['prev_' . $rec_type];
+    }
+
+    $meter_read = (float)$_POST['end_' . $rec_type];
+    $unit_price = (float)$_POST['price_' . $rec_type];
+
+    if ($meter_read < $meter_start) {
+        $error_messages[] = 'เลขมิเตอร์ปลายเดือนต้องไม่น้อยกว่าเลขมิเตอร์ต้นเดือน';
+    }
+
+    $amount_used = $meter_read - $meter_start;
+    $cost = $amount_used * $unit_price;
+    $save_unit = ($prev_amount - $amount_used) * $unit_price;
+    $co2e_save = ($prev_amount - $amount_used) * $type_info['factor'];
+
+    if (count($error_messages) == 0) {
+        $reason_text = "ลดการใช้{$type_info['title']}ประจำเดือน $month_display";
+        $escaped_reason = mysqli_real_escape_string($conn, $reason_text);
+
+        // กรณีเป็นเดือนที่ถูกปฏิเสธ: ลบข้อมูลเก่าและหักลบแต้มเดิมที่เคยให้
+        if ($is_rejected_month) {
+            $old_points = 0;
+            $sql_find_old_pts = "SELECT * FROM eco_point_ledger WHERE company_id = $cid";
+            $query_old_pts = mysqli_query($conn, $sql_find_old_pts);
+            while ($p_row = mysqli_fetch_assoc($query_old_pts)) {
+                if ($p_row['reason'] == $reason_text) {
+                    $old_points = $old_points + (int)$p_row['point'];
+                }
+            }
+
+            if ($old_points != 0) {
+                $negative_pts = -$old_points;
+                $sql_cancel_pts = "INSERT INTO eco_point_ledger (company_id, point, reason) VALUES ($cid, $negative_pts, '$escaped_reason')";
+                mysqli_query($conn, $sql_cancel_pts);
+            }
+
+            foreach ($all_logs as $old_log) {
+                if ($old_log['type'] == $rec_type) {
+                    $old_log_month = date('Y-m', strtotime($old_log['record_date']));
+                    if ($old_log_month == $record_month) {
+                        $old_log_id = (int)$old_log['id'];
+                        mysqli_query($conn, "DELETE FROM utility_logs WHERE id = $old_log_id");
+                    }
                 }
             }
         }
 
-        // อัปโหลดสลิปเดือนนี้
-        $pic = '';
-        if($_FILES["evidence_$t"]['error'] === UPLOAD_ERR_OK){
-            $ext = strtolower(pathinfo($_FILES["evidence_$t"]['name'], PATHINFO_EXTENSION));
-            $pic = uniqid('ev_') . '.' . $ext;
-            move_uploaded_file($_FILES["evidence_$t"]['tmp_name'], "uploads/$pic");
+        // จัดการอัปโหลดรูปภาพสลิปหลักฐานประจำเดือนนี้
+        $uploaded_slip = '';
+        if (isset($_FILES['evidence_' . $rec_type]) && $_FILES['evidence_' . $rec_type]['error'] === UPLOAD_ERR_OK) {
+            $ext = strtolower(pathinfo($_FILES['evidence_' . $rec_type]['name'], PATHINFO_EXTENSION));
+            $uploaded_slip = uniqid('ev_') . '.' . $ext;
+            if (!is_dir('uploads')) {
+                mkdir('uploads', 0777, true);
+            }
+            move_uploaded_file($_FILES['evidence_' . $rec_type]['tmp_name'], 'uploads/' . $uploaded_slip);
         }
-        // อัปโหลดสลิปเดือนก่อน (เฉพาะครั้งแรก)
-        $pic_prev = '';
-        if(!$hp && $_FILES["evidence_prev_$t"]['error'] === UPLOAD_ERR_OK){
-            $ext = strtolower(pathinfo($_FILES["evidence_prev_$t"]['name'], PATHINFO_EXTENSION));
-            $pic_prev = uniqid('ev_') . '.' . $ext;
-            move_uploaded_file($_FILES["evidence_prev_$t"]['tmp_name'], "uploads/$pic_prev");
+
+        // จัดการอัปโหลดรูปภาพสลิปหลักฐานของเดือนก่อน (เฉพาะครั้งแรกที่ยังไม่มีข้อมูลเดิม)
+        $uploaded_prev_slip = '';
+        if (!$has_prev && isset($_FILES['evidence_prev_' . $rec_type]) && $_FILES['evidence_prev_' . $rec_type]['error'] === UPLOAD_ERR_OK) {
+            $ext_prev = strtolower(pathinfo($_FILES['evidence_prev_' . $rec_type]['name'], PATHINFO_EXTENSION));
+            $uploaded_prev_slip = uniqid('ev_') . '.' . $ext_prev;
+            if (!is_dir('uploads')) {
+                mkdir('uploads', 0777, true);
+            }
+            move_uploaded_file($_FILES['evidence_prev_' . $rec_type]['tmp_name'], 'uploads/' . $uploaded_prev_slip);
         }
-        mysqli_query($conn, "insert into utility_logs(company_id,type,meter_start,meter_read,unit_price,prev_amount,amount,cost,save_unit,co2e_save,evidence_url,evidence_prev_url,note,record_date) values($cid,'$t','$d[0]','$d[1]','$d[2]','$d[3]','$d[4]','$d[5]','$d[6]','$d[7]','$pic','$pic_prev','$note','$month-01')");
 
-        $diff = $tp - $tn;
-        $pct = $tp > 0 ? $diff / $tp * 100 : 0;
-        $point = round(max(0, $diff) * $ppk);
-        if($point > 0) mysqli_query($conn, "insert into eco_point_ledger(company_id,point,reason) values($cid,$point,'$reason')");
+        $escaped_note = mysqli_real_escape_string($conn, $note);
+        $full_record_date = $record_month . '-01';
 
-        $_SESSION['msg'] = ['success', "บันทึก{$info[4]} $mt สำเร็จ! ประหยัด " . number_format($tb, 2) . " บาท | ลดคาร์บอนได้ " . number_format($diff, 2) . " kg (" . number_format($pct, 1) . "%)" . ($point > 0 ? " +$point แต้ม" : "")];
+        // บันทึกลงในตาราง utility_logs
+        $sql_insert_log = "INSERT INTO utility_logs (company_id, type, meter_start, meter_read, unit_price, prev_amount, amount, cost, save_unit, co2e_save, evidence_url, evidence_prev_url, note, record_date) VALUES ($cid, '$rec_type', '$meter_start', '$meter_read', '$unit_price', '$prev_amount', '$amount_used', '$cost', '$save_unit', '$co2e_save', '$uploaded_slip', '$uploaded_prev_slip', '$escaped_note', '$full_record_date')";
+        mysqli_query($conn, $sql_insert_log);
+
+        // คำนวณแต้มสะสมที่ได้รับ
+        $diff_carbon = $co2e_save;
+        if ($prev_amount > 0) {
+            $diff_percent = ($diff_carbon / ($prev_amount * $type_info['factor'])) * 100;
+        } else {
+            $diff_percent = 0;
+        }
+
+        if ($diff_carbon > 0) {
+            $earned_points = round($diff_carbon * $point_per_kg);
+        } else {
+            $earned_points = 0;
+        }
+
+        if ($earned_points > 0) {
+            $sql_award_points = "INSERT INTO eco_point_ledger (company_id, point, reason) VALUES ($cid, $earned_points, '$escaped_reason')";
+            mysqli_query($conn, $sql_award_points);
+        }
+
+        $success_msg = "บันทึก{$type_info['title']} $month_display สำเร็จ! ประหยัด " . number_format($save_unit, 2) . " บาท | ลดคาร์บอนได้ " . number_format($diff_carbon, 2) . " kg (" . number_format($diff_percent, 1) . "%)";
+        if ($earned_points > 0) {
+            $success_msg = $success_msg . " (ได้รับ +$earned_points แต้ม)";
+        }
+
+        $_SESSION['flash_type'] = 'success';
+        $_SESSION['flash_text'] = $success_msg;
         header('location: utility.php');
         exit();
     }
 }
 
-$msg = $_SESSION['msg'] ?? null;
-unset($_SESSION['msg']);
-$result = mysqli_query($conn, "select * from utility_logs where company_id=$cid order by record_date desc, id desc limit 20");
+// ดึงข้อความแจ้งเตือนจากเซสชัน
+$alert_type = '';
+$alert_text = '';
+
+if (isset($_SESSION['flash_type'])) {
+    $alert_type = $_SESSION['flash_type'];
+    $alert_text = $_SESSION['flash_text'];
+    unset($_SESSION['flash_type']);
+    unset($_SESSION['flash_text']);
+}
+
+// ดึงรายการประวัติการบันทึก 20 รายการล่าสุด
+$sql_recent_logs = "SELECT * FROM utility_logs WHERE company_id = $cid ORDER BY record_date DESC, id DESC LIMIT 20";
+$recent_logs_query = mysqli_query($conn, $sql_recent_logs);
 ?>
 <!DOCTYPE html>
 <html lang="th">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>บันทึกค่าน้ำ-ค่าไฟ</title>
+    <title>บันทึกค่าน้ำ-ค่าไฟ - Ecolyn</title>
 </head>
 <body class="bg-light">
-<?php include 'navbar.php'; ?>
+    <!-- แถบเมนูด้านบน -->
+    <?php include 'navbar.php'; ?>
 
-<div class="container py-4">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-        <h4 class="fw-bold">บันทึกการใช้น้ำ-ไฟฟ้า (รายเดือน)</h4>
-        <div>
-            <?php foreach($types as $t => $info): ?>
-                <button type="button" class="btn <?= $t == 'elec' ? 'btn-warning' : 'btn-primary' ?>" data-bs-toggle="modal" data-bs-target="#addModal_<?= $t ?>">+ บันทึก<?= $info[4] ?></button>
-            <?php endforeach; ?>
-        </div>
-    </div>
-
-    <?php if($msg): ?><div class="alert alert-<?= $msg[0] ?>"><?= $msg[1] ?></div><?php endif; ?>
-    <?php foreach($errors as $e): ?><div class="alert alert-danger py-2"><?= $e ?></div><?php endforeach; ?>
-    <?php foreach($rejected as $x): ?>
-        <div class="alert alert-danger py-2">หลักฐาน<?= $types[$x['type']][4] ?> ประจำเดือน <?= date('m/Y', strtotime($x['record_date'])) ?> ไม่ผ่านการตรวจสอบ: <?= $x['review_note'] ?> — กรุณากรอกข้อมูล<?= $types[$x['type']][4] ?>เดือนนี้ใหม่ทั้งเดือน</div>
-    <?php endforeach; ?>
-
-    <div class="card shadow-sm mb-3 <?= $can_cert ? 'bg-warning-subtle' : '' ?>">
-        <div class="card-body d-flex justify-content-between align-items-center">
+    <div class="container py-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h4 class="fw-bold mb-0">บันทึกการใช้น้ำ-ไฟฟ้า (รายเดือน)</h4>
             <div>
-                <h6 class="fw-bold mb-1">ขอรับใบรับรองลดคาร์บอน</h6>
-                <small class="text-muted d-block">เงื่อนไข: ลดคาร์บอนได้ 10% ขึ้นไป และบันทึกข้อมูลครบ 10 เดือน (ภายใน 1 ปี)</small>
-                <small>
-                    ลดได้ <b class="<?= $percent >= 10 ? 'text-success' : 'text-danger' ?>"><?= number_format($percent, 1) ?>%</b> ·
-                    บันทึกแล้ว <b class="<?= $months >= 10 ? 'text-success' : 'text-danger' ?>"><?= $months ?>/10 เดือน</b>
-                    <?php if($asked): ?><span class="badge bg-info text-dark">ส่งคำขอแล้ว</span><?php endif; ?>
-                </small>
+                <?php foreach ($types as $t_key => $t_info) { ?>
+                    <button type="button" class="btn <?php if ($t_key == 'elec') { echo 'btn-warning text-dark'; } else { echo 'btn-primary'; } ?> ms-2" data-bs-toggle="modal" data-bs-target="#addModal_<?php echo $t_key; ?>">
+                        + บันทึก<?php echo $t_info['title']; ?>
+                    </button>
+                <?php } ?>
             </div>
-            <form method="post" onsubmit="return confirm('ยืนยันการขอรับใบรับรอง?')">
-                <button name="request_cert" value="1" class="btn <?= $can_cert ? 'btn-warning' : 'btn-secondary' ?>" <?= $can_cert ? '' : 'disabled' ?>>ขอรับใบรับรอง</button>
-            </form>
+        </div>
+
+        <?php if ($alert_text != '') { ?>
+            <div class="alert alert-<?php echo $alert_type; ?> p-3 mb-3">
+                <?php echo $alert_text; ?>
+            </div>
+        <?php } ?>
+
+        <?php foreach ($error_messages as $err) { ?>
+            <div class="alert alert-danger py-2 mb-2">
+                <?php echo $err; ?>
+            </div>
+        <?php } ?>
+
+        <?php foreach ($rejected_logs as $rej) { ?>
+            <div class="alert alert-danger py-2 mb-2">
+                หลักฐาน<?php echo $types[$rej['type']]['title']; ?> ประจำเดือน <?php echo date('m/Y', strtotime($rej['record_date'])); ?> ไม่ผ่านการตรวจสอบ: 
+                <strong><?php echo htmlspecialchars($rej['review_note']); ?></strong> — กรุณากรอกข้อมูลเดือนนี้ใหม่อีกครั้ง
+            </div>
+        <?php } ?>
+
+        <!-- กล่องสถานะการขอรับใบรับรอง -->
+        <div class="card shadow-sm mb-3 <?php if ($can_request_certificate) { echo 'bg-warning-subtle'; } ?>">
+            <div class="card-body d-flex justify-content-between align-items-center">
+                <div>
+                    <h6 class="fw-bold mb-1">ขอรับใบรับรองลดคาร์บอน (Certificate)</h6>
+                    <small class="text-muted d-block">เงื่อนไข: ลดคาร์บอนได้ 10% ขึ้นไป และบันทึกข้อมูลครบ 10 เดือน (ภายในรอบ 1 ปี)</small>
+                    <small>
+                        ลดได้: <b class="<?php if ($reduction_percent >= 10) { echo 'text-success'; } else { echo 'text-danger'; } ?>"><?php echo number_format($reduction_percent, 1); ?>%</b> · 
+                        บันทึกแล้ว: <b class="<?php if ($recorded_months_count >= 10) { echo 'text-success'; } else { echo 'text-danger'; } ?>"><?php echo $recorded_months_count; ?>/10 เดือน</b>
+                        <?php if ($already_requested_cert) { ?>
+                            <span class="badge bg-info text-dark ms-2">ส่งคำขอแล้ว</span>
+                        <?php } ?>
+                    </small>
+                </div>
+                <form method="post" action="utility.php" onsubmit="return confirm('ยืนยันการขอรับใบรับรองลดคาร์บอน?')">
+                    <button type="submit" name="request_cert" value="1" class="btn <?php if ($can_request_certificate) { echo 'btn-warning text-dark fw-bold'; } else { echo 'btn-secondary'; } ?>" <?php if (!$can_request_certificate) { echo 'disabled'; } ?>>
+                        ขอรับใบรับรอง
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- ตารางประวัติบันทึกข้อมูลล่าสุด -->
+        <div class="card shadow-sm p-3">
+            <h6 class="fw-bold mb-3">ประวัติการบันทึกข้อมูลล่าสุด</h6>
+            <div class="table-responsive">
+                <table class="table table-hover table-bordered align-middle text-center mb-0">
+                    <thead class="bg-light">
+                        <tr>
+                            <th>ประจำเดือน</th>
+                            <th>หมวด</th>
+                            <th>มิเตอร์ ต้น-ปลาย</th>
+                            <th>ปริมาณที่ใช้</th>
+                            <th>ค่าใช้จ่าย (บาท)</th>
+                            <th>ประหยัด (บาท)</th>
+                            <th>CO₂ ลดได้ (kg)</th>
+                            <th>หลักฐานสลิป</th>
+                            <th>สถานะการตรวจ</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php 
+                    while ($u = mysqli_fetch_assoc($recent_logs_query)) { 
+                        $u_type = $u['type'];
+                        $is_positive_save = ($u['save_unit'] >= 0);
+                        $review_status = $u['review_status'];
+                    ?>
+                        <tr>
+                            <td><?php echo date('m/Y', strtotime($u['record_date'])); ?></td>
+                            <td><?php echo $types[$u_type]['name']; ?></td>
+                            <td><?php echo number_format($u['meter_start'], 2); ?> - <?php echo number_format($u['meter_read'], 2); ?></td>
+                            <td><?php echo number_format($u['amount'], 2); ?></td>
+                            <td><?php echo number_format($u['cost'], 2); ?></td>
+                            <td class="<?php echo $is_positive_save ? 'text-success' : 'text-danger'; ?>">
+                                <?php echo number_format($u['save_unit'], 2); ?>
+                            </td>
+                            <td><?php echo number_format($u['co2e_save'], 2); ?></td>
+                            <td>
+                                <?php if ($u['evidence_url'] != '') { ?>
+                                    <a href="uploads/<?php echo htmlspecialchars($u['evidence_url']); ?>" target="_blank" class="btn btn-sm btn-outline-secondary">ดูรูป</a>
+                                <?php } ?>
+                                <?php if ($u['evidence_prev_url'] != '') { ?>
+                                    <a href="uploads/<?php echo htmlspecialchars($u['evidence_prev_url']); ?>" target="_blank" class="btn btn-sm btn-outline-secondary">เดือนก่อน</a>
+                                <?php } ?>
+                            </td>
+                            <td>
+                                <?php 
+                                if ($review_status == 'Y') {
+                                    echo '<span class="badge bg-success">อนุมัติ</span>';
+                                } else if ($review_status == 'R') {
+                                    echo '<span class="badge bg-danger">ไม่อนุมัติ</span>';
+                                } else {
+                                    echo '<span class="badge bg-warning text-dark">รอตรวจ</span>';
+                                }
+                                ?>
+                            </td>
+                        </tr>
+                    <?php } ?>
+                    <?php if (mysqli_num_rows($recent_logs_query) == 0) { ?>
+                        <tr>
+                            <td colspan="9" class="text-center text-muted py-3">ยังไม่มีข้อมูลการบันทึก</td>
+                        </tr>
+                    <?php } ?>
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 
-    <div class="card shadow-sm p-3">
-        <table class="table table-hover table-bordered align-middle">
-            <thead class="bg-light">
-                <tr class="text-center">
-                    <th>ประจำเดือน</th><th>หมวด</th><th>มิเตอร์ ต้น-ปลาย</th><th>ใช้ไป</th><th>ค่าใช้จ่าย</th>
-                    <th>ประหยัด (บาท)</th><th>CO₂ ลดได้ (kg)</th><th>หลักฐาน</th><th>สถานะ</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php while($u = mysqli_fetch_assoc($result)): ?>
-                <tr class="text-center">
-                    <td><?= date('m/Y', strtotime($u['record_date'])) ?></td>
-                    <td><?= $types[$u['type']][0] ?></td>
-                    <td><?= number_format($u['meter_start'], 2) ?> - <?= number_format($u['meter_read'], 2) ?></td>
-                    <td><?= number_format($u['amount'], 2) ?></td>
-                    <td><?= number_format($u['cost'], 2) ?></td>
-                    <td class="<?= $u['save_unit'] >= 0 ? 'text-success' : 'text-danger' ?>"><?= number_format($u['save_unit'], 2) ?></td>
-                    <td><?= number_format($u['co2e_save'], 2) ?></td>
-                    <td>
-                        <?php if($u['evidence_url'] != ''): ?><a href="uploads/<?= $u['evidence_url'] ?>" target="_blank" class="btn btn-sm btn-outline-secondary">ดูรูป</a><?php endif; ?>
-                        <?php if($u['evidence_prev_url'] != ''): ?><a href="uploads/<?= $u['evidence_prev_url'] ?>" target="_blank" class="btn btn-sm btn-outline-secondary">เดือนก่อน</a><?php endif; ?>
-                    </td>
-                    <td>
-                        <?php if($u['review_status'] == 'Y'): ?><span class="badge bg-success">อนุมัติ</span>
-                        <?php elseif($u['review_status'] == 'R'): ?><span class="badge bg-danger">ไม่อนุมัติ</span>
-                        <?php else: ?><span class="badge bg-warning text-dark">รอตรวจ</span><?php endif; ?>
-                    </td>
-                </tr>
-            <?php endwhile; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<?php foreach($types as $t => $info): ?>
-<?php $hp = isset($has_prev[$t]); $same = ($_POST['rec_type'] ?? '') == $t; ?>
-<div class="modal fade" id="addModal_<?= $t ?>" tabindex="-1">
-    <div class="modal-dialog modal-lg">
-        <div class="modal-content">
-            <form method="post" enctype="multipart/form-data">
-                <input type="hidden" name="rec_type" value="<?= $t ?>">
-                <div class="modal-header">
-                    <h5 class="modal-title fw-bold">บันทึก<?= $info[4] ?>ประจำเดือน</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body">
-                    <div class="alert alert-info py-2 small"><b>ใช้เดือนก่อน</b> = ปริมาณที่ใช้ไปในเดือนที่แล้ว เอามาเทียบกับเดือนนี้ ถ้าใช้น้อยกว่าเดือนก่อน จะลดคาร์บอนและประหยัดเงินได้</div>
-                    <div class="mb-3">
-                        <label class="form-label">ประจำเดือน</label>
-                        <input type="month" name="record_month" class="form-control" value="<?= $same ? $_POST['record_month'] : $redo[$t] ?>" max="<?= date('Y-m') ?>" required>
+    <!-- ป็อปอัป (Modal) สำหรับบันทึกข้อมูลค่าน้ำ-ค่าไฟ แยกตามประเภท -->
+    <?php 
+    foreach ($types as $t_key => $t_info) { 
+        $has_previous = isset($has_previous_record[$t_key]);
+        $default_month = $redo_month[$t_key];
+    ?>
+    <div class="modal fade" id="addModal_<?php echo $t_key; ?>" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <form method="post" action="utility.php" enctype="multipart/form-data">
+                    <input type="hidden" name="rec_type" value="<?php echo $t_key; ?>">
+                    <div class="modal-header">
+                        <h5 class="modal-title fw-bold">บันทึก<?php echo $t_info['title']; ?>ประจำเดือน</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
-
-                    <div class="border rounded p-3 mb-3 bg-light">
-                        <h6 class="fw-bold"><?= $info[0] ?> (<?= $info[1] ?>)</h6>
-                        <div class="row g-2">
-                            <div class="col-6">
-                                <label class="form-label small">มิเตอร์เดือนที่แล้ว</label>
-                                <input type="number" step="0.01" min="0" name="start_<?= $t ?>" class="form-control" value="<?= $def[$t]['start'] ?>" required <?= $hp ? 'disabled' : '' ?>>
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label small">มิเตอร์เดือนล่าสุด</label>
-                                <input type="number" step="0.01" min="0" name="end_<?= $t ?>" class="form-control" value="<?= $same ? $_POST["end_$t"] : '' ?>" required>
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label small">ราคา/หน่วย (บาท)</label>
-                                <input type="number" step="0.01" min="0" name="price_<?= $t ?>" class="form-control" value="<?= $same ? $_POST["price_$t"] : $def[$t]['price'] ?>" required>
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label small">ใช้เดือนก่อน (<?= $info[1] ?>)</label>
-                                <input type="number" step="0.01" min="0" name="prev_<?= $t ?>" class="form-control" value="<?= $def[$t]['prev'] ?>" required <?= $hp ? 'disabled' : '' ?>>
-                            </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info py-2 small">
+                            <b>ใช้เดือนก่อน</b> = ปริมาณที่ใช้ไปในเดือนที่แล้ว สำหรับนำมาเปรียบเทียบกับเดือนนี้ หากใช้น้อยลงจะช่วยประหยัดเงินและลดคาร์บอน
                         </div>
-                        <label class="form-label small mt-2">หลักฐานสลิป<?= $info[4] ?> (เดือนนี้)</label>
-                        <input type="file" name="evidence_<?= $t ?>" accept="image/*" class="form-control">
-                        <?php if(!$hp): ?>
-                            <label class="form-label small mt-2">หลักฐานสลิป<?= $info[4] ?>เดือนก่อน</label>
-                            <input type="file" name="evidence_prev_<?= $t ?>" accept="image/*" class="form-control">
-                        <?php endif; ?>
-                    </div>
+                        <div class="mb-3">
+                            <label class="form-label">ประจำเดือน</label>
+                            <input type="month" name="record_month" class="form-control" value="<?php echo $default_month; ?>" max="<?php echo date('Y-m'); ?>" required>
+                        </div>
 
-                    <div class="mb-3">
-                        <label class="form-label">หมายเหตุเพิ่มเติม</label>
-                        <input type="text" name="note" class="form-control" value="<?= $same ? $_POST['note'] : '' ?>">
+                        <div class="border rounded p-3 mb-3 bg-light">
+                            <h6 class="fw-bold mb-3"><?php echo $t_info['name']; ?> (หน่วย: <?php echo $t_info['unit']; ?>)</h6>
+                            <div class="row g-3">
+                                <div class="col-6">
+                                    <label class="form-label small">เลขมิเตอร์ต้นเดือน (หรือสิ้นเดือนที่แล้ว)</label>
+                                    <input type="number" step="0.01" min="0" name="start_<?php echo $t_key; ?>" class="form-control" value="<?php echo $form_defaults[$t_key]['start']; ?>" required <?php if ($has_previous) { echo 'disabled'; } ?>>
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small">เลขมิเตอร์ปลายเดือนนี้</label>
+                                    <input type="number" step="0.01" min="0" name="end_<?php echo $t_key; ?>" class="form-control" placeholder="กรอกเลขมิเตอร์ล่าสุด" required>
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small">ราคาต่อหน่วย (บาท)</label>
+                                    <input type="number" step="0.01" min="0" name="price_<?php echo $t_key; ?>" class="form-control" value="<?php echo $form_defaults[$t_key]['price']; ?>" required>
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small">ปริมาณที่ใช้เดือนก่อน (<?php echo $t_info['unit']; ?>)</label>
+                                    <input type="number" step="0.01" min="0" name="prev_<?php echo $t_key; ?>" class="form-control" value="<?php echo $form_defaults[$t_key]['prev']; ?>" required <?php if ($has_previous) { echo 'disabled'; } ?>>
+                                </div>
+                            </div>
+
+                            <div class="mt-3">
+                                <label class="form-label small">หลักฐานสลิป<?php echo $t_info['title']; ?> (ประจำเดือนนี้)</label>
+                                <input type="file" name="evidence_<?php echo $t_key; ?>" accept="image/*" class="form-control">
+                            </div>
+
+                            <?php if (!$has_previous) { ?>
+                                <div class="mt-3">
+                                    <label class="form-label small">หลักฐานสลิป<?php echo $t_info['title']; ?> (ประจำเดือนก่อนหน้า)</label>
+                                    <input type="file" name="evidence_prev_<?php echo $t_key; ?>" accept="image/*" class="form-control">
+                                </div>
+                            <?php } ?>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">หมายเหตุเพิ่มเติม</label>
+                            <input type="text" name="note" class="form-control" placeholder="ระบุหมายเหตุ (ถ้ามี)">
+                        </div>
                     </div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">ยกเลิก</button>
-                    <button type="submit" class="btn btn-success">บันทึก</button>
-                </div>
-            </form>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">ยกเลิก</button>
+                        <button type="submit" class="btn btn-success">บันทึกข้อมูล</button>
+                    </div>
+                </form>
+            </div>
         </div>
     </div>
-</div>
-<?php endforeach; ?>
-<script src="<?= $base ?>js/bootstrap.bundle.min.js"></script>
-<?php include 'footer.php'; ?>
+    <?php } ?>
+
+    <!-- ส่วนท้ายเว็บไซต์ -->
+    <?php include 'footer.php'; ?>
+    <script src="<?php echo $base; ?>js/bootstrap.bundle.min.js"></script>
 </body>
 </html>

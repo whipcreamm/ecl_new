@@ -1,28 +1,64 @@
 <?php
+// เริ่มต้นเซสชัน
 session_start();
-include '../config.php';
 
-$company_id = $_SESSION['company_id'];
+// ดึงไฟล์เชื่อมต่อฐานข้อมูล
+include 'config.php';
 
-// เฉพาะแอดมิน (role_id = 1)
-$company = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id=$company_id"));
-if($company['role_id'] != 1){
-    header('location: ../login.php');
+// ตรวจสอบว่าผู้ใช้ล็อกอินอยู่หรือไม่
+if (!isset($_SESSION['company_id'])) {
+    header('location: login.php');
     exit();
 }
 
-// ตัวกรอง
-$from_month = $_GET['from_month'] ?? date('Y-01');
-$to_month = $_GET['to_month'] ?? date('Y-m');
-$utility_type = $_GET['type'] ?? '';
-$keyword = $_GET['q'] ?? '';
+// ตรวจสอบสิทธิ์ผู้ดูแลระบบ (Admin: role_id = 1)
+$company_id = (int)$_SESSION['company_id'];
+$sql_check_admin = "SELECT * FROM company WHERE id = $company_id";
+$admin_query = mysqli_query($conn, $sql_check_admin);
+$company_data = mysqli_fetch_assoc($admin_query);
 
+if (!$company_data || $company_data['role_id'] != 1) {
+    header('location: login.php');
+    exit();
+}
+
+// รับค่าตัวกรองค้นหาจาก URL ถ้าไม่มีให้ใช้ค่าเริ่มต้น
+if (isset($_GET['from_month']) && $_GET['from_month'] != '') {
+    $from_month = $_GET['from_month'];
+} else {
+    $from_month = date('Y-01');
+}
+
+if (isset($_GET['to_month']) && $_GET['to_month'] != '') {
+    $to_month = $_GET['to_month'];
+} else {
+    $to_month = date('Y-m');
+}
+
+if (isset($_GET['type'])) {
+    $utility_type = $_GET['type'];
+} else {
+    $utility_type = '';
+}
+
+if (isset($_GET['q'])) {
+    $keyword = $_GET['q'];
+} else {
+    $keyword = '';
+}
+
+// ตั้งค่า Header สำหรับส่งออกเป็นไฟล์ CSV ภาษาไทย
 header('Content-Type: text/csv; charset=utf-8');
 header('Content-Disposition: attachment; filename=ecolyn_monthly_report_' . date('Ymd_His') . '.csv');
 
-echo "\xEF\xBB\xBF"; // UTF-8 BOM ให้ Excel อ่านภาษาไทยได้
-$output = fopen('php://output', 'w');
-fputcsv($output, [
+// ใส่ UTF-8 BOM เพื่อให้โปรแกรม Microsoft Excel เปิดอ่านภาษาไทยได้ถูกต้อง ไม่เป็นภาษาต่างดาว
+echo "\xEF\xBB\xBF";
+
+// เปิด output stream สำหรับเขียนข้อมูล CSV
+$output_file = fopen('php://output', 'w');
+
+// เขียนหัวตารางข้อมูลใน CSV
+$csv_headers = array(
     'ประจำเดือน',
     'เดือน/ปี',
     'ชื่อบริษัท/หน่วยงาน',
@@ -33,30 +69,66 @@ fputcsv($output, [
     'ประหยัดได้ในเดือน (หน่วย)',
     'kgCO2e ที่ลดได้',
     'หมายเหตุ'
-]);
+);
+fputcsv($output_file, $csv_headers);
 
-$result = mysqli_query($conn, "select * from utility_logs order by record_date desc, id desc");
-while($l = mysqli_fetch_assoc($result)){
-    $month = date('Y-m', strtotime($l['record_date']));
-    if($month < $from_month || $month > $to_month) continue;
-    if($utility_type != '' && $l['type'] != $utility_type) continue;
+// ดึงรายการบันทึกการใช้พลังงานทั้งหมด เรียงลำดับจากวันที่ล่าสุด
+$sql_logs = "SELECT * FROM utility_logs ORDER BY record_date DESC, id DESC";
+$log_result = mysqli_query($conn, $sql_logs);
 
-    // ดึงชื่อบริษัทแยก
-    $cm = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id={$l['company_id']}"));
-    if($keyword != '' && strpos($cm['name'], $keyword) === false) continue;
+while ($row = mysqli_fetch_assoc($log_result)) {
+    $log_month = date('Y-m', strtotime($row['record_date']));
 
-    fputcsv($output, [
-        $month,
-        date('m/Y', strtotime($l['record_date'])),
-        $cm['name'],
-        $l['type'] == 'elec' ? 'ไฟฟ้า' : 'น้ำประปา',
-        $l['meter_read'],
-        $l['amount'],
-        $l['prev_amount'],
-        $l['save_unit'],
-        $l['co2e_save'],
-        $l['note']
-    ]);
+    // กรองช่วงเดือน
+    if ($log_month < $from_month || $log_month > $to_month) {
+        continue;
+    }
+
+    // กรองประเภทการใช้งาน (ไฟฟ้า หรือ น้ำประปา)
+    if ($utility_type != '' && $row['type'] != $utility_type) {
+        continue;
+    }
+
+    // ค้นหาชื่อบริษัทของบันทึกนี้
+    $log_company_id = (int)$row['company_id'];
+    $sql_com = "SELECT * FROM company WHERE id = $log_company_id";
+    $com_res = mysqli_query($conn, $sql_com);
+    $com_data = mysqli_fetch_assoc($com_res);
+    $company_name = $com_data ? $com_data['name'] : '-';
+
+    // กรองด้วยคำค้นหาชื่อบริษัท
+    if ($keyword != '') {
+        if (strpos($company_name, $keyword) === false) {
+            continue;
+        }
+    }
+
+    // กำหนดข้อความภาษาไทยสำหรับประเภทการใช้งาน
+    if ($row['type'] == 'elec') {
+        $type_text = 'ไฟฟ้า';
+    } else {
+        $type_text = 'น้ำประปา';
+    }
+
+    $month_year_display = date('m/Y', strtotime($row['record_date']));
+
+    // บันทึกแถวข้อมูลลงใน CSV
+    $row_data = array(
+        $log_month,
+        $month_year_display,
+        $company_name,
+        $type_text,
+        $row['meter_read'],
+        $row['amount'],
+        $row['prev_amount'],
+        $row['save_unit'],
+        $row['co2e_save'],
+        $row['note']
+    );
+    fputcsv($output_file, $row_data);
 }
-fclose($output);
+
+// ปิดการเขียนไฟล์และสิ้นสุดการทำงาน
+fclose($output_file);
 exit();
+?>

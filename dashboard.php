@@ -1,130 +1,232 @@
 <?php
+// เริ่มต้นเซสชัน
 session_start();
+
+// ดึงไฟล์เชื่อมต่อฐานข้อมูล
 include 'config.php';
+
+// ตรวจสอบว่าผู้ใช้ล็อกอินอยู่หรือไม่ ถ้ายังไม่ล็อกอินให้กลับไปหน้า login
 if (!isset($_SESSION['company_id'])) {
-    header('location:login.php');
-    exit();
-}
-$company_id = $_SESSION['company_id'];
-
-// แอดมิน หรือสมาชิกที่มีแพ็กเกจที่ใช้งานอยู่
-$company = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id=$company_id"));
-$is_admin = $company['role_id'] == 1;
-$has_package = mysqli_num_rows(mysqli_query($conn, "select * from members where company_id=$company_id and status_mem='Y' and (end_mem is null or end_mem >= curdate())"));
-if(!$is_admin && $has_package == 0){
-    header('location: package.php');
+    header('location: login.php');
     exit();
 }
 
-// ค่า factor
-$settings = [];
-$setting_result = mysqli_query($conn, "select * from eco_setting");
-while($setting_row = mysqli_fetch_assoc($setting_result)){
-    $settings[$setting_row['setting_key']] = $setting_row['setting_value'];
-}
-$factor_electricity = $settings['factor_elec'] ?? 0.4999;
-$factor_water = $settings['factor_water'] ?? 0.7;
+$company_id = (int)$_SESSION['company_id'];
 
-// ตัวกรอง
-$from_month = $_GET['from_month'] ?? date('Y-01');
-$to_month = $_GET['to_month'] ?? date('Y-m');
-$utility_type = $_GET['type'] ?? '';
-if($from_month > $to_month){
+// 1. ตรวจสอบสิทธิ์ผู้ใช้งาน (ต้องเป็น Admin หรือสมาชิกที่มีแพ็กเกจที่ยังไม่หมดอายุ)
+$sql_user_company = "SELECT * FROM company WHERE id = $company_id";
+$query_user_company = mysqli_query($conn, $sql_user_company);
+$company = mysqli_fetch_assoc($query_user_company);
+
+$is_admin = ($company && isset($company['role_id']) && $company['role_id'] == 1);
+
+$sql_pack_check = "SELECT * FROM members WHERE company_id = $company_id AND status_mem = 'Y' AND (end_mem IS NULL OR end_mem >= CURDATE())";
+$query_pack_check = mysqli_query($conn, $sql_pack_check);
+$has_package = mysqli_num_rows($query_pack_check);
+
+if (!$is_admin && $has_package == 0) {
+    header('location: pack.php');
+    exit();
+}
+
+// 2. ดึงค่าสัมประสิทธิ์การปล่อยก๊าซเรือนกระจก (Emission Factor)
+$settings = array();
+$sql_settings = "SELECT * FROM eco_setting";
+$query_settings = mysqli_query($conn, $sql_settings);
+
+while ($setting_row = mysqli_fetch_assoc($query_settings)) {
+    $s_key = $setting_row['setting_key'];
+    $s_val = $setting_row['setting_value'];
+    $settings[$s_key] = $s_val;
+}
+
+if (isset($settings['factor_elec'])) {
+    $factor_electricity = (float)$settings['factor_elec'];
+} else {
+    $factor_electricity = 0.4999;
+}
+
+if (isset($settings['factor_water'])) {
+    $factor_water = (float)$settings['factor_water'];
+} else {
+    $factor_water = 0.7;
+}
+
+// 3. จัดการตัวกรองช่วงเดือนและประเภทการใช้งาน
+if (isset($_GET['from_month']) && $_GET['from_month'] != '') {
+    $from_month = $_GET['from_month'];
+} else {
+    $from_month = date('Y-01');
+}
+
+if (isset($_GET['to_month']) && $_GET['to_month'] != '') {
+    $to_month = $_GET['to_month'];
+} else {
+    $to_month = date('Y-m');
+}
+
+if ($from_month > $to_month) {
     $temp_month = $from_month;
     $from_month = $to_month;
     $to_month = $temp_month;
 }
 
-// ---------- ดึงบันทึกทั้งหมด แล้วบวกเองใน PHP ----------
-$monthly = [];     // เดือน => ข้อมูลของบริษัทเรา
-$type_co2 = [];    // ประเภท => co2 (ทั้งระบบ)
-$co2_of = [];      // ชื่อบริษัท => รวม co2
-$months_of = [];   // ชื่อบริษัท => [เดือนที่บันทึก]
-$id_of = [];       // ชื่อบริษัท => id
+if (isset($_GET['type'])) {
+    $utility_type = $_GET['type'];
+} else {
+    $utility_type = '';
+}
+
+// 4. คำนวณสรุปข้อมูลสถิติ
+$monthly = array();        // สรุปข้อมูลรายเดือนของบริษัทเรา
+$type_co2 = array();       // สัดส่วน CO2 แยกตามประเภท (ทั้งระบบ)
+$co2_by_company = array(); // รวม CO2 ของแต่ละบริษัท
+$months_by_company = array(); // เดือนที่บันทึกของแต่ละบริษัท
+$id_by_company = array();     // รหัสบริษัท
+
 $total_baht_saved = 0;
 $total_carbon_used = 0;
 $total_carbon_previous = 0;
 
-$log_result = mysqli_query($conn, "select * from utility_logs order by record_date");
-while($l = mysqli_fetch_assoc($log_result)){
-    $month = date('Y-m', strtotime($l['record_date']));
-    if($month < $from_month || $month > $to_month) continue;
-    if($utility_type != '' && $l['type'] != $utility_type) continue;
+$sql_logs = "SELECT * FROM utility_logs ORDER BY record_date ASC";
+$log_result = mysqli_query($conn, $sql_logs);
 
-    // สัดส่วนตามประเภท (ทั้งระบบ)
-    if(!isset($type_co2[$l['type']])) $type_co2[$l['type']] = 0;
-    $type_co2[$l['type']] += $l['co2e_save'];
+while ($log = mysqli_fetch_assoc($log_result)) {
+    $log_date = $log['record_date'];
+    $month = date('Y-m', strtotime($log_date));
 
-    // อันดับสมาชิก (ดึงชื่อบริษัทแยก)
-    $cm = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id={$l['company_id']}"));
-    $cname = $cm['name'];
-    if(!isset($co2_of[$cname])){
-        $co2_of[$cname] = 0;
-        $id_of[$cname] = $l['company_id'];
+    // กรองช่วงเดือน
+    if ($month < $from_month || $month > $to_month) {
+        continue;
     }
-    $co2_of[$cname] += $l['co2e_save'];
-    $months_of[$cname][$month] = 1;
 
-    // สรุปรายเดือนเฉพาะบริษัทเรา
-    if($l['company_id'] != $company_id) continue;
-    if(!isset($monthly[$month])){
-        $monthly[$month] = ['elec_use' => 0, 'elec_prev' => 0, 'water_use' => 0, 'water_prev' => 0, 'baht' => 0];
+    // กรองประเภทการใช้งาน
+    if ($utility_type != '' && $log['type'] != $utility_type) {
+        continue;
     }
-    if($l['type'] == 'elec'){
-        $monthly[$month]['elec_use'] += $l['amount'];
-        $monthly[$month]['elec_prev'] += $l['prev_amount'];
-    }else{
-        $monthly[$month]['water_use'] += $l['amount'];
-        $monthly[$month]['water_prev'] += $l['prev_amount'];
+
+    $log_type = $log['type'];
+    $co2_save_val = (float)$log['co2e_save'];
+
+    // รวมสัดส่วน CO2 ทั้งระบบตามประเภท
+    if (!isset($type_co2[$log_type])) {
+        $type_co2[$log_type] = 0;
     }
-    $monthly[$month]['baht'] += $l['save_unit'];
+    $type_co2[$log_type] = $type_co2[$log_type] + $co2_save_val;
+
+    // ดึงชื่อบริษัทเพื่อรวบรวมอันดับ
+    $log_cid = (int)$log['company_id'];
+    $sql_c = "SELECT * FROM company WHERE id = $log_cid";
+    $query_c = mysqli_query($conn, $sql_c);
+    $c_row = mysqli_fetch_assoc($query_c);
+    $c_name = $c_row ? $c_row['name'] : 'ไม่ระบุ';
+
+    if (!isset($co2_by_company[$c_name])) {
+        $co2_by_company[$c_name] = 0;
+        $id_by_company[$c_name] = $log_cid;
+    }
+    $co2_by_company[$c_name] = $co2_by_company[$c_name] + $co2_save_val;
+    $months_by_company[$c_name][$month] = 1;
+
+    // ประมวลผลเฉพาะข้อมูลของบริษัทที่กำลังล็อกอินอยู่
+    if ($log_cid != $company_id) {
+        continue;
+    }
+
+    if (!isset($monthly[$month])) {
+        $monthly[$month] = array(
+            'elec_use'   => 0,
+            'elec_prev'  => 0,
+            'water_use'  => 0,
+            'water_prev' => 0,
+            'baht'       => 0
+        );
+    }
+
+    if ($log_type == 'elec') {
+        $monthly[$month]['elec_use'] = $monthly[$month]['elec_use'] + (float)$log['amount'];
+        $monthly[$month]['elec_prev'] = $monthly[$month]['elec_prev'] + (float)$log['prev_amount'];
+    } else {
+        $monthly[$month]['water_use'] = $monthly[$month]['water_use'] + (float)$log['amount'];
+        $monthly[$month]['water_prev'] = $monthly[$month]['water_prev'] + (float)$log['prev_amount'];
+    }
+
+    $monthly[$month]['baht'] = $monthly[$month]['baht'] + (float)$log['save_unit'];
 }
-krsort($monthly);      // เดือนใหม่ -> เก่า
-arsort($co2_of);       // co2 มาก -> น้อย
-$top_list = array_slice($co2_of, 0, 10, true);
 
-// คำนวณคาร์บอนรายเดือน
-foreach($monthly as $month => $m){
-    $used = $m['elec_use'] * $factor_electricity + $m['water_use'] * $factor_water;
-    $previous = $m['elec_prev'] * $factor_electricity + $m['water_prev'] * $factor_water;
-    $saved = $previous - $used;
-    $monthly[$month]['carbon_used'] = $used;
-    $monthly[$month]['carbon_saved'] = $saved;
-    $monthly[$month]['percent_saved'] = $previous > 0 ? $saved / $previous * 100 : 0;
-    $monthly[$month]['percent_used'] = $previous > 0 ? $used / $previous * 100 : 0;
-    $total_carbon_used += $used;
-    $total_carbon_previous += $previous;
-    $total_baht_saved += $m['baht'];
+// เรียงลำดับเดือนจากใหม่ไปหาเก่าสำหรับตาราง
+krsort($monthly);
+
+// จัดเรียงอันดับบริษัทที่ลด CO2 ได้มากที่สุด 10 อันดับแรก
+arsort($co2_by_company);
+$top_list = array_slice($co2_by_company, 0, 10, true);
+
+// คำนวณคาร์บอนที่ใช้ และคาร์บอนที่ลดได้ในแต่ละเดือน
+foreach ($monthly as $month_key => $data) {
+    $used_carbon = ($data['elec_use'] * $factor_electricity) + ($data['water_use'] * $factor_water);
+    $previous_carbon = ($data['elec_prev'] * $factor_electricity) + ($data['water_prev'] * $factor_water);
+    $saved_carbon = $previous_carbon - $used_carbon;
+
+    if ($previous_carbon > 0) {
+        $percent_saved = ($saved_carbon / $previous_carbon) * 100;
+        $percent_used = ($used_carbon / $previous_carbon) * 100;
+    } else {
+        $percent_saved = 0;
+        $percent_used = 0;
+    }
+
+    $monthly[$month_key]['carbon_used'] = $used_carbon;
+    $monthly[$month_key]['carbon_saved'] = $saved_carbon;
+    $monthly[$month_key]['percent_saved'] = $percent_saved;
+    $monthly[$month_key]['percent_used'] = $percent_used;
+
+    $total_carbon_used = $total_carbon_used + $used_carbon;
+    $total_carbon_previous = $total_carbon_previous + $previous_carbon;
+    $total_baht_saved = $total_baht_saved + $data['baht'];
 }
+
 $total_carbon_saved = $total_carbon_previous - $total_carbon_used;
 
-// แต้มและอันดับของตัวเอง
+// 5. คำนวณแต้มสะสมและอันดับของบริษัทตัวเอง
 $my_points = 0;
-$point_result = mysqli_query($conn, "select * from eco_point_ledger where company_id=$company_id");
-while($p = mysqli_fetch_assoc($point_result)){
-    $my_points += $p['point'];
+$sql_my_pts = "SELECT * FROM eco_point_ledger WHERE company_id = $company_id";
+$query_my_pts = mysqli_query($conn, $sql_my_pts);
+
+while ($pt = mysqli_fetch_assoc($query_my_pts)) {
+    $my_points = $my_points + (int)$pt['point'];
 }
+
 $my_rank = '-';
-$rank = 1;
-foreach($top_list as $cname => $co2){
-    if($id_of[$cname] == $company_id) $my_rank = '#' . $rank;
-    $rank++;
+$current_rank = 1;
+foreach ($co2_by_company as $c_name => $c_co2) {
+    if (isset($id_by_company[$c_name]) && $id_by_company[$c_name] == $company_id) {
+        $my_rank = '#' . $current_rank;
+        break;
+    }
+    $current_rank = $current_rank + 1;
 }
 
-// ข้อมูลกราฟ (เก่า -> ใหม่)
-$chart_labels = [];
-$chart_values = [];
-foreach(array_reverse($monthly, true) as $month => $m){
-    $chart_labels[] = $month;
-    $chart_values[] = (float)$m['carbon_saved'];
+// 6. เตรียมข้อมูลสำหรับส่งให้กราฟ Chart.js (เรียงจากเดือนเก่าไปหาใหม่)
+$chart_labels = array();
+$chart_values = array();
+
+$monthly_asc = array_reverse($monthly, true);
+foreach ($monthly_asc as $m_name => $m_data) {
+    $chart_labels[] = $m_name;
+    $chart_values[] = round($m_data['carbon_saved'], 2);
 }
 
-$type_names = ['elec' => 'ไฟฟ้า', 'water' => 'น้ำประปา'];
-$type_labels = [];
-$type_values = [];
-foreach($type_co2 as $t => $v){
-    $type_labels[] = $type_names[$t];
-    $type_values[] = (float)$v;
+$type_display_names = array('elec' => 'ไฟฟ้า', 'water' => 'น้ำประปา');
+$pie_labels = array();
+$pie_values = array();
+
+foreach ($type_co2 as $t_key => $t_sum) {
+    if (isset($type_display_names[$t_key])) {
+        $pie_labels[] = $type_display_names[$t_key];
+    } else {
+        $pie_labels[] = $t_key;
+    }
+    $pie_values[] = round($t_sum, 2);
 }
 ?>
 <!DOCTYPE html>
@@ -132,170 +234,249 @@ foreach($type_co2 as $t => $v){
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>แดชบอร์ดสรุปผลการลดคาร์บอน</title>
+    <title>แดชบอร์ดสรุปผลการลดคาร์บอน - Ecolyn</title>
 </head>
 <body class="bg-light">
-<?php include 'navbar.php'; ?>
+    <!-- แถบเมนูด้านบน -->
+    <?php include 'navbar.php'; ?>
 
-<div class="container mb-5">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-        <h4 class="fw-bold">รายงานสรุปผลการลดคาร์บอน (รายเดือน)</h4>
-        <a href="export.php?from_month=<?= $from_month ?>&to_month=<?= $to_month ?>&type=<?= $utility_type ?>" class="btn btn-outline-success btn-sm">ส่งออกข้อมูลรายเดือน (CSV)</a>
-    </div>
+    <div class="container mb-5">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h4 class="fw-bold mb-0">รายงานสรุปผลการลดคาร์บอน (รายเดือน)</h4>
+            <?php if ($is_admin) { ?>
+                <a href="export.php?from_month=<?php echo $from_month; ?>&to_month=<?php echo $to_month; ?>&type=<?php echo $utility_type; ?>" class="btn btn-outline-success btn-sm">
+                    ส่งออกข้อมูลรายเดือน (CSV)
+                </a>
+            <?php } ?>
+        </div>
 
-    <!-- การ์ดสรุป -->
-    <div class="row g-3 mb-4">
-        <div class="col-6 col-md-3">
-            <div class="card p-3 text-center shadow-sm h-100 bg-success text-white">
-                <h3 class="fw-bold mb-0"><?= number_format($total_carbon_saved, 2) ?></h3>
-                <small>คาร์บอนที่ลดได้สะสม (kgCO₂e)</small>
+        <!-- การ์ดสรุปตัวเลขสถิติภาพรวม -->
+        <div class="row g-3 mb-4">
+            <div class="col-6 col-md-3">
+                <div class="card p-3 text-center shadow-sm h-100 bg-success text-white">
+                    <h3 class="fw-bold mb-0"><?php echo number_format($total_carbon_saved, 2); ?></h3>
+                    <small>คาร์บอนที่ลดได้สะสม (kgCO₂e)</small>
+                </div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="card p-3 text-center shadow-sm h-100">
+                    <h3 class="fw-bold mb-0 text-warning"><?php echo number_format($total_baht_saved, 2); ?></h3>
+                    <small class="text-muted">ประหยัดค่าใช้จ่ายรวม (บาท)</small>
+                </div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="card p-3 text-center shadow-sm h-100">
+                    <h3 class="fw-bold mb-0 text-success"><?php echo number_format($my_points); ?></h3>
+                    <small class="text-muted">แต้มสะสมขององค์กร</small>
+                </div>
+            </div>
+            <div class="col-6 col-md-3">
+                <div class="card p-3 text-center shadow-sm h-100">
+                    <h3 class="fw-bold mb-0 text-primary"><?php echo $my_rank; ?></h3>
+                    <small class="text-muted">อันดับในตาราง</small>
+                </div>
             </div>
         </div>
-        <div class="col-6 col-md-3">
-            <div class="card p-3 text-center shadow-sm h-100">
-                <h3 class="fw-bold mb-0 text-warning"><?= number_format($total_baht_saved, 2) ?></h3>
-                <small class="text-muted">ประหยัดค่าใช้จ่ายรวม (บาท)</small>
+
+        <!-- กล่องตัวกรองค้นหาตามเดือนและประเภท -->
+        <div class="card p-3 shadow-sm mb-4">
+            <form class="row g-2 align-items-end" method="get" action="dashboard.php">
+                <div class="col-md-4">
+                    <label class="form-label small">ตั้งแต่ประจำเดือน</label>
+                    <input type="month" name="from_month" class="form-control form-control-sm" value="<?php echo $from_month; ?>">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small">ถึงประจำเดือน</label>
+                    <input type="month" name="to_month" class="form-control form-control-sm" value="<?php echo $to_month; ?>">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label small">ประเภท</label>
+                    <select name="type" class="form-select form-select-sm">
+                        <option value="">ทั้งหมด</option>
+                        <option value="elec" <?php if ($utility_type == 'elec') { echo 'selected'; } ?>>ไฟฟ้า</option>
+                        <option value="water" <?php if ($utility_type == 'water') { echo 'selected'; } ?>>น้ำประปา</option>
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-success btn-sm w-100">ค้นหารายเดือน</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- กราฟสถิติ -->
+        <div class="row g-3 mb-4">
+            <div class="col-lg-7">
+                <div class="card p-3 shadow-sm h-100">
+                    <h6 class="fw-bold">ปริมาณ CO₂ ที่ลดได้รายเดือน (kgCO₂e)</h6>
+                    <div style="height: 260px;">
+                        <canvas id="monthChart"></canvas>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-5">
+                <div class="card p-3 shadow-sm h-100">
+                    <h6 class="fw-bold">สัดส่วน CO₂ ลดได้แยกตามประเภท</h6>
+                    <div style="height: 260px;">
+                        <canvas id="typeChart"></canvas>
+                    </div>
+                </div>
             </div>
         </div>
-        <div class="col-6 col-md-3">
-            <div class="card p-3 text-center shadow-sm h-100">
-                <h3 class="fw-bold mb-0 text-success"><?= number_format($my_points) ?></h3>
-                <small class="text-muted">แต้มสะสม</small>
+
+        <!-- ตารางสรุปรายเดือน -->
+        <div class="card p-3 shadow-sm mb-4">
+            <h5 class="fw-bold mb-3">สรุปผลการใช้งานรายเดือน</h5>
+            <div class="table-responsive">
+                <table class="table table-bordered table-hover align-middle text-center mb-1">
+                    <thead class="bg-light">
+                        <tr>
+                            <th>ประจำเดือน</th>
+                            <th>ใช้ไฟ (kWh)</th>
+                            <th>ใช้น้ำ (ลบ.ม.)</th>
+                            <th>ประหยัด (บาท)</th>
+                            <th>คาร์บอนที่ปล่อย (kg)</th>
+                            <th>คาร์บอนที่ลดได้ (kg)</th>
+                            <th>สัดส่วนลด (%)</th>
+                            <th>สัดส่วนใช้ (%)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php 
+                    foreach ($monthly as $month_str => $m) { 
+                        $is_baht_saved = ($m['baht'] >= 0);
+                        $is_carbon_saved = ($m['carbon_saved'] >= 0);
+                    ?>
+                        <tr>
+                            <td><?php echo date('m/Y', strtotime($month_str . '-01')); ?></td>
+                            <td><?php echo number_format($m['elec_use'], 2); ?></td>
+                            <td><?php echo number_format($m['water_use'], 2); ?></td>
+                            <td class="<?php echo $is_baht_saved ? 'text-success' : 'text-danger'; ?>">
+                                <?php echo number_format($m['baht'], 2); ?>
+                            </td>
+                            <td><?php echo number_format($m['carbon_used'], 2); ?></td>
+                            <td class="<?php echo $is_carbon_saved ? 'text-success' : 'text-danger'; ?>">
+                                <?php echo number_format($m['carbon_saved'], 2); ?>
+                            </td>
+                            <td class="<?php echo $is_carbon_saved ? 'text-success' : 'text-danger'; ?>">
+                                <?php echo number_format($m['percent_saved'], 1); ?>%
+                            </td>
+                            <td><?php echo number_format($m['percent_used'], 1); ?>%</td>
+                        </tr>
+                    <?php } ?>
+                    <?php if (count($monthly) == 0) { ?>
+                        <tr>
+                            <td colspan="8" class="text-center text-muted py-3">ไม่พบข้อมูลบันทึกในช่วงเวลานี้</td>
+                        </tr>
+                    <?php } ?>
+                    </tbody>
+                </table>
             </div>
+            <small class="text-muted mt-2 d-block">
+                * สัดส่วนลด (%) = คาร์บอนที่ลดได้ ÷ คาร์บอนเดือนก่อน | สัดส่วนใช้ (%) = คาร์บอนเดือนนี้ ÷ คาร์บอนเดือนก่อน
+            </small>
         </div>
-        <div class="col-6 col-md-3">
-            <div class="card p-3 text-center shadow-sm h-100">
-                <h3 class="fw-bold mb-0 text-primary"><?= $my_rank ?></h3>
-                <small class="text-muted">อันดับในตาราง</small>
+
+        <!-- ตารางอันดับสมาชิกที่ลด CO2 สูงสุด -->
+        <div class="card p-3 shadow-sm">
+            <h6 class="fw-bold mb-3">สมาชิกที่ช่วยลด CO₂ สูงสุดในช่วงเดือนที่เลือก</h6>
+            <div class="table-responsive">
+                <table class="table table-bordered table-hover align-middle mb-0">
+                    <thead class="bg-light">
+                        <tr>
+                            <th class="text-center" style="width: 100px;">อันดับ</th>
+                            <th>ชื่อบริษัท/สถานศึกษา</th>
+                            <th class="text-center" style="width: 200px;">จำนวนเดือนที่บันทึก</th>
+                            <th class="text-end" style="width: 220px;">CO₂ ที่ลดได้ (kgCO₂e)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php 
+                    $rank_counter = 1; 
+                    foreach ($top_list as $company_title => $co2_val) { 
+                        $is_current_user = (isset($id_by_company[$company_title]) && $id_by_company[$company_title] == $company_id);
+                        $recorded_months_count = isset($months_by_company[$company_title]) ? count($months_by_company[$company_title]) : 0;
+                    ?>
+                        <tr class="<?php if ($is_current_user) { echo 'table-success fw-bold'; } ?>">
+                            <td class="text-center"><?php echo $rank_counter; ?></td>
+                            <td>
+                                <?php echo htmlspecialchars($company_title); ?>
+                                <?php if ($is_current_user) { ?>
+                                    <span class="badge bg-success ms-1">องค์กรของคุณ</span>
+                                <?php } ?>
+                            </td>
+                            <td class="text-center"><?php echo $recorded_months_count; ?> เดือน</td>
+                            <td class="text-end"><?php echo number_format($co2_val, 2); ?></td>
+                        </tr>
+                    <?php 
+                        $rank_counter = $rank_counter + 1;
+                    } 
+                    ?>
+                    <?php if (count($top_list) == 0) { ?>
+                        <tr>
+                            <td colspan="4" class="text-center text-muted py-3">ยังไม่มีข้อมูลสถิติ</td>
+                        </tr>
+                    <?php } ?>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
 
-    <!-- ตัวกรอง -->
-    <div class="card p-3 shadow-sm mb-4">
-        <form class="row g-2 align-items-end" method="get">
-            <div class="col-md-4">
-                <label class="form-label small">ตั้งแต่ประจำเดือน</label>
-                <input type="month" name="from_month" class="form-control form-control-sm" value="<?= $from_month ?>">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label small">ถึงประจำเดือน</label>
-                <input type="month" name="to_month" class="form-control form-control-sm" value="<?= $to_month ?>">
-            </div>
-            <div class="col-md-2">
-                <label class="form-label small">ประเภท</label>
-                <select name="type" class="form-select form-select-sm">
-                    <option value="">ทั้งหมด</option>
-                    <option value="elec" <?= $utility_type == 'elec' ? 'selected' : '' ?>>ไฟฟ้า</option>
-                    <option value="water" <?= $utility_type == 'water' ? 'selected' : '' ?>>น้ำประปา</option>
-                </select>
-            </div>
-            <div class="col-md-2">
-                <button class="btn btn-success btn-sm w-100">ค้นหารายเดือน</button>
-            </div>
-        </form>
-    </div>
+    <!-- ส่วนท้ายเว็บไซต์ -->
+    <?php include 'footer.php'; ?>
+    <script src="<?php echo $base; ?>js/bootstrap.bundle.min.js"></script>
 
-    <!-- กราฟ -->
-    <div class="row g-3 mb-4">
-        <div class="col-lg-7">
-            <div class="card p-3 shadow-sm h-100">
-                <h6 class="fw-bold">ปริมาณ CO₂ ที่ลดได้รายเดือน (kgCO₂e)</h6>
-                <div style="height:260px"><canvas id="monthChart"></canvas></div>
-            </div>
-        </div>
-        <div class="col-lg-5">
-            <div class="card p-3 shadow-sm h-100">
-                <h6 class="fw-bold">สัดส่วน CO₂ ลดได้แยกตามประเภท</h6>
-                <div style="height:260px"><canvas id="typeChart"></canvas></div>
-            </div>
-        </div>
-    </div>
+    <!-- กราฟ Chart.js -->
+    <script src="<?php echo $base; ?>js/chart.umd.js"></script>
+    <script>
+        // กราฟแท่งแสดง CO2 ที่ลดได้ในแต่ละเดือน
+        const barLabels = <?php echo json_encode($chart_labels); ?>;
+        const barValues = <?php echo json_encode($chart_values); ?>;
 
-    <!-- สรุปรายเดือน -->
-    <div class="card p-3 shadow-sm mb-4">
-        <h5 class="fw-bold mb-3">สรุปรายเดือน</h5>
-        <table class="table table-bordered table-hover align-middle text-center">
-            <thead class="bg-light">
-                <tr>
-                    <th>ประจำเดือน</th>
-                    <th>ใช้ไฟ (kWh)</th>
-                    <th>ใช้น้ำ (ลบ.ม.)</th>
-                    <th>ประหยัด (บ.)</th>
-                    <th>คาร์บอนใช้ (kg)</th>
-                    <th>ลดได้ (kg)</th>
-                    <th>ลด %</th>
-                    <th>ใช้ %</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php foreach($monthly as $month => $m): ?>
-                <tr>
-                    <td><?= date('m/Y', strtotime($month . '-01')) ?></td>
-                    <td><?= number_format($m['elec_use'], 2) ?></td>
-                    <td><?= number_format($m['water_use'], 2) ?></td>
-                    <td class="<?= $m['baht'] >= 0 ? 'text-success' : 'text-danger' ?>"><?= number_format($m['baht'], 2) ?></td>
-                    <td><?= number_format($m['carbon_used'], 2) ?></td>
-                    <td class="<?= $m['carbon_saved'] >= 0 ? 'text-success' : 'text-danger' ?>"><?= number_format($m['carbon_saved'], 2) ?></td>
-                    <td class="<?= $m['carbon_saved'] >= 0 ? 'text-success' : 'text-danger' ?>"><?= number_format($m['percent_saved'], 1) ?>%</td>
-                    <td><?= number_format($m['percent_used'], 1) ?>%</td>
-                </tr>
-            <?php endforeach; ?>
-            </tbody>
-        </table>
-        <small class="text-muted">ลด % = คาร์บอนที่ลดได้ ÷ คาร์บอนเดือนก่อน | ใช้ % = คาร์บอนเดือนนี้ ÷ คาร์บอนเดือนก่อน</small>
-    </div>
+        new Chart('monthChart', {
+            type: 'bar',
+            data: {
+                labels: barLabels,
+                datasets: [{
+                    label: 'CO₂ ที่ลดได้ (kgCO₂e)',
+                    data: barValues,
+                    backgroundColor: '#198754'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
 
-    <!-- อันดับ -->
-    <div class="card p-3 shadow-sm">
-        <h6 class="fw-bold mb-3">สมาชิกที่ช่วยลด CO₂ สูงสุดในช่วงเดือนที่เลือก</h6>
-        <table class="table table-bordered table-hover align-middle">
-            <thead class="bg-light">
-                <tr>
-                    <th class="text-center">อันดับ</th>
-                    <th>ชื่อบริษัท/สถานศึกษา</th>
-                    <th class="text-center">จำนวนเดือนที่บันทึก</th>
-                    <th class="text-end">CO₂ ที่ลดได้ (kgCO₂e)</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php $rank = 1; foreach($top_list as $cname => $co2): ?>
-                <tr class="<?= $id_of[$cname] == $company_id ? 'table-success fw-bold' : '' ?>">
-                    <td class="text-center"><?= $rank++ ?></td>
-                    <td>
-                        <?= $cname ?>
-                        <?php if($id_of[$cname] == $company_id): ?><span class="badge bg-success">องค์กรของคุณ</span><?php endif; ?>
-                    </td>
-                    <td class="text-center"><?= count($months_of[$cname]) ?> เดือน</td>
-                    <td class="text-end"><?= number_format($co2, 2) ?></td>
-                </tr>
-            <?php endforeach; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
-<script src="<?= $base ?>js/bootstrap.bundle.min.js"></script>
-<?php include 'footer.php'; ?>
+        // กราฟวงกลมแสดงสัดส่วนแยกตามประเภท (ไฟฟ้า / น้ำประปา)
+        const pieLabels = <?php echo json_encode($pie_labels, JSON_UNESCAPED_UNICODE); ?>;
+        const pieValues = <?php echo json_encode($pie_values); ?>;
 
-<script src="<?= $base ?>js/chart.umd.js"></script>
-<script>
-new Chart('monthChart', {
-    type: 'bar',
-    data: {
-        labels: <?= json_encode($chart_labels) ?>,
-        datasets: [{label: 'CO₂ ที่ลดได้', data: <?= json_encode($chart_values) ?>, backgroundColor: '#198754'}]
-    },
-    options: {responsive: true, maintainAspectRatio: false, scales: {y: {beginAtZero: true}}}
-});
-
-new Chart('typeChart', {
-    type: 'pie',
-    data: {
-        labels: <?= json_encode($type_labels, JSON_UNESCAPED_UNICODE) ?>,
-        datasets: [{data: <?= json_encode($type_values) ?>, backgroundColor: ['#198754', '#20bec9']}]
-    },
-    options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'bottom'}}}
-});
-</script>
+        new Chart('typeChart', {
+            type: 'pie',
+            data: {
+                labels: pieLabels,
+                datasets: [{
+                    data: pieValues,
+                    backgroundColor: ['#198754', '#20bec9']
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+    </script>
 </body>
 </html>

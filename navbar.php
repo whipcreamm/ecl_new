@@ -1,166 +1,226 @@
 <?php
+// ดึงไฟล์เชื่อมต่อฐานข้อมูล
 include 'config.php';
 
-$in_admin = strpos($_SERVER['PHP_SELF'], '/admin/') !== false;
-$base = $in_admin ? '../' : '';
-$admin = $in_admin ? '' : 'admin/';
-$page = basename($_SERVER['PHP_SELF']);
+// ตรวจสอบว่าตำแหน่งไฟล์ปัจจุบันอยู่ในโฟลเดอร์ admin หรือไม่
+$current_script_path = $_SERVER['PHP_SELF'];
+$is_inside_admin = (strpos($current_script_path, '/admin/') !== false);
 
-$cid = $_SESSION['company_id'] ?? 0;
+// กำหนด path อ้างอิงโฟลเดอร์หลัก และโฟลเดอร์ admin
+if ($is_inside_admin) {
+    $base = '../';
+    $admin = '';
+} else {
+    $base = '';
+    $admin = 'admin/';
+}
+
+$current_page = basename($current_script_path);
+
+// ดึงรหัสองค์กรจากเซสชัน (ถ้ามี)
+if (isset($_SESSION['company_id'])) {
+    $cid = (int)$_SESSION['company_id'];
+} else {
+    $cid = 0;
+}
+
 $company = null;
 $pack_name = '';
-$unread = 0;
+$unread_count = 0;
 
-if($cid){
-    $company = mysqli_fetch_assoc(mysqli_query($conn, "select * from company where id=$cid"));
-    $pack = mysqli_fetch_assoc(mysqli_query($conn, "select * from members join pack on pack.id = members.pack_id where members.company_id=$cid and members.status_mem='Y' and (members.end_mem is null or members.end_mem >= curdate()) order by members.id desc limit 1"));
-    if($pack) $pack_name = $pack['name'];
-    $unread = mysqli_num_rows(mysqli_query($conn, "select * from noti where recip_id=$cid and is_read=0"));
+if ($cid > 0) {
+    // ดึงข้อมูลบริษัท
+    $sql_com = "SELECT * FROM company WHERE id = $cid";
+    $query_com = mysqli_query($conn, $sql_com);
+    $company = mysqli_fetch_assoc($query_com);
+
+    // ดึงแพ็กเกจที่ใช้งานได้ปัจจุบัน
+    $sql_pack = "SELECT members.*, pack.name AS pack_name FROM members JOIN pack ON pack.id = members.pack_id WHERE members.company_id = $cid AND members.status_mem = 'Y' AND (members.end_mem IS NULL OR members.end_mem >= CURDATE()) ORDER BY members.id DESC LIMIT 1";
+    $query_pack = mysqli_query($conn, $sql_pack);
+    $active_pack = mysqli_fetch_assoc($query_pack);
+
+    if ($active_pack) {
+        $pack_name = $active_pack['pack_name'];
+    }
+
+    // นับจำนวนการแจ้งเตือนที่ยังไม่ได้อ่าน
+    $sql_unread = "SELECT * FROM noti WHERE recip_id = $cid AND is_read = 0";
+    $query_unread = mysqli_query($conn, $sql_unread);
+    $unread_count = mysqli_num_rows($query_unread);
 }
 
-$is_admin = ($company['role_id'] ?? 0) == 1;
-
-if($pack_name == ''){
-    $menu = [
-        'index.php'=>'หน้าหลัก', 
-        'product.php'=>'ร้านค้า', 
-        'news.php'=>'ข่าวสาร', 
-        'rank.php'=>'ดูการจัดอันดับ', 
-        'pack.php'=>'สมัครแพ็กเกจ'
-        ];
-}else{
-    $menu = [
-        'dashboard.php'=>'แดชบอร์ด', 
-        'utility.php'=>'บันทึกค่าน้ำ-ค่าไฟ', 
-        'product.php'=>'ร้านค้า', 
-        'news.php'=>'ข่าวสาร', 
-        'rank.php'=>'ดูการจัดอันดับ', 
-        'pack.php'=>'เปลี่ยนแพ็กเกจ'
-    ];
-    if(stripos($pack_name, 'premium') !== false || strpos($pack_name, 'พรีเมี่ยม') !== false){
-    $menu['mission.php'] = 'ภารกิจ';
-}
+// ตรวจสอบว่าเป็นผู้ดูแลระบบ (Admin: role_id = 1) หรือไม่
+$is_admin = false;
+if ($company && isset($company['role_id']) && $company['role_id'] == 1) {
+    $is_admin = true;
 }
 
-$admin_menu = [
-    'dashboard.php'=>'แดชบอร์ด', 
-    'mission_review.php'=>'ตรวจหลักฐานภารกิจ', 
-    'utility_review.php'=>'ตรวจหลักฐานบันทึกค่าน้ำ-ไฟ', 
-    'pack_review.php'=>'อนุมัติแพ็คเกจ', 
-    'certificate_review.php'=>'อนุมัติใบรับรอง'
-    ];
-$manage_menu = [
-    'product_edit.php'=>'จัดการสินค้า', 
-    'product_order.php'=>'จัดการคำสั่งซื้อ', 
-    'mission_edit.php'=>'จัดการภารกิจ', 
-    'news_edit.php'=>'จัดการข่าวสาร', 
-    'user_edit.php'=>'จัดการสมาชิก', 
-    'pack_edit.php'=>'จัดการแพ็คเกจ', 
-    '-1'   => '',
-    'setting.php'=>'ตั้งค่าระบบ'
-    ];
+// กำหนดเมนูสำหรับผู้ใช้ทั่วไป
+$user_menu = array();
+if ($pack_name == '') {
+    // กรณียังไม่มีแพ็กเกจ
+    $user_menu = array(
+        'index.php'   => 'หน้าหลัก',
+        'product.php' => 'ร้านค้า',
+        'news.php'    => 'ข่าวสาร',
+        'rank.php'    => 'ดูการจัดอันดับ',
+        'pack.php'    => 'สมัครแพ็กเกจ'
+    );
+} else {
+    // กรณีมีแพ็กเกจแล้ว
+    $user_menu = array(
+        'dashboard.php' => 'แดชบอร์ด',
+        'utility.php'   => 'บันทึกค่าน้ำ-ค่าไฟ',
+        'product.php'   => 'ร้านค้า',
+        'news.php'      => 'ข่าวสาร',
+        'rank.php'      => 'ดูการจัดอันดับ',
+        'pack.php'      => 'เปลี่ยนแพ็กเกจ'
+    );
+
+    // ถ้าเป็นแพ็กเกจ Premium ให้เปิดเมนูภารกิจ
+    $is_premium = (stripos($pack_name, 'premium') !== false || strpos($pack_name, 'พรีเมี่ยม') !== false);
+    if ($is_premium) {
+        $user_menu['mission.php'] = 'ภารกิจ';
+    }
+}
+
+// เมนูสำหรับผู้ดูแลระบบ (Admin)
+$admin_review_menu = array(
+    'dashboard.php'          => 'แดชบอร์ด',
+    'mission_review.php'     => 'ตรวจหลักฐานภารกิจ',
+    'utility_review.php'     => 'ตรวจหลักฐานบันทึกค่าน้ำ-ไฟ',
+    'pack_review.php'        => 'อนุมัติแพ็คเกจ',
+    'certificate_review.php' => 'อนุมัติใบรับรอง'
+);
+
+$admin_manage_menu = array(
+    'product_edit.php'  => 'จัดการสินค้า',
+    'product_order.php' => 'จัดการคำสั่งซื้อ',
+    'mission_edit.php'  => 'จัดการภารกิจ',
+    'news_edit.php'     => 'จัดการข่าวสาร',
+    'user_edit.php'     => 'จัดการสมาชิก',
+    'pack_edit.php'     => 'จัดการแพ็คเกจ',
+    'divider'           => '',
+    'setting.php'       => 'ตั้งค่าระบบ'
+);
 ?>
-<link rel="stylesheet" href="<?= $base ?>css/bootstrap.min.css">
+<link rel="stylesheet" href="<?php echo $base; ?>css/bootstrap.min.css">
 <style>
-    .bg-green{
+    .bg-green {
         background-color: #08543c;
     }
-    
-    .btn-green{
-        background: #08543c;
-        color:white;
+    .btn-green {
+        background-color: #08543c;
+        color: #ffffff;
     }
-    .btn-green:hover{
-        background: #023c2a;
-        color:white;
+    .btn-green:hover {
+        background-color: #023c2a;
+        color: #ffffff;
     }
-
-    .card-white{
+    .card-white {
         border-radius: 13px;
+        transition: transform 0.2s ease;
     }
-    .card-white:hover{
-    transform: translateY(-3px);
+    .card-white:hover {
+        transform: translateY(-3px);
     }
-
-    .card-green{
-        color: white;
-        background: #08543c;
+    .card-green {
+        color: #ffffff;
+        background-color: #08543c;
         border-radius: 13px;
+        transition: transform 0.2s ease;
     }
-    .card-green:hover{
-    transform: translateY(-3px);
+    .card-green:hover {
+        transform: translateY(-3px);
     }
-
-    .text-green{
+    .text-green {
         color: #08543c;
     }
-    .bg-orange{
-            background: #f87d09;
-        }
+    .bg-orange {
+        background-color: #f87d09;
+    }
 </style>
+
 <nav class="navbar navbar-expand-lg navbar-dark mb-4 shadow-sm bg-green">
     <div class="container">
-        <a href="<?= $base ?>index.php" class="navbar-brand">
-            <img src="<?= $base ?>img/Logo.png" style="height:45px;">
+        <!-- โลโก้เว็บไซต์ -->
+        <a href="<?php echo $base; ?>index.php" class="navbar-brand">
+            <img src="<?php echo $base; ?>img/Logo.png" style="height: 45px;" alt="Ecolyn Logo">
         </a>
+
+        <!-- ปุ่มเปิดเมนูบนมือถือ -->
         <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMenu">
             <span class="navbar-toggler-icon"></span>
         </button>
-        <div class="collapse navbar-collapse bg" id="navMenu">
+
+        <div class="collapse navbar-collapse" id="navMenu">
             <ul class="navbar-nav me-auto">
-
-                <?php if($is_admin): ?>
-                    <?php foreach($admin_menu as $file => $label): ?>
+                <?php if ($is_admin) { ?>
+                    <!-- เมนูหลักของ Admin -->
+                    <?php foreach ($admin_review_menu as $file_name => $menu_label) { ?>
                         <li class="nav-item">
-                            <a class="nav-link <?= $page == $file ? 'active fw-bold' : '' ?>" href="<?= $admin . $file ?>"><?= $label ?></a>
+                            <a class="nav-link <?php if ($current_page == $file_name) { echo 'active fw-bold'; } ?>" href="<?php echo $admin . $file_name; ?>">
+                                <?php echo $menu_label; ?>
+                            </a>
                         </li>
-                    <?php endforeach; ?>
+                    <?php } ?>
 
+                    <!-- เมนูดรอปดาวน์จัดการระบบสำหรับ Admin -->
                     <li class="nav-item dropdown">
                         <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown">เมนูจัดการระบบ</a>
                         <ul class="dropdown-menu">
-                            <?php foreach($manage_menu as $file => $label): ?>
-                                <?php if($label): ?>
-                                    <li><a class="dropdown-item" href="<?= $admin . $file ?>"><?= $label ?></a></li>
-                                <?php else: ?>
+                            <?php foreach ($admin_manage_menu as $file_name => $menu_label) { ?>
+                                <?php if ($file_name == 'divider') { ?>
                                     <li><hr class="dropdown-divider"></li>
-                                <?php endif; ?>
-                            <?php endforeach; ?>
+                                <?php } else { ?>
+                                    <li>
+                                        <a class="dropdown-item" href="<?php echo $admin . $file_name; ?>">
+                                            <?php echo $menu_label; ?>
+                                        </a>
+                                    </li>
+                                <?php } ?>
+                            <?php } ?>
                         </ul>
                     </li>
 
-                <?php elseif($company): ?>
-                    <?php foreach($menu as $file => $label): ?>
+                <?php } else if ($company) { ?>
+                    <!-- เมนูสำหรับสมาชิกทั่วไป -->
+                    <?php foreach ($user_menu as $file_name => $menu_label) { ?>
                         <li class="nav-item">
-                            <a class="nav-link <?= $page == $file ? 'active fw-bold' : '' ?>" href="<?= $base . $file ?>"><?= $label ?></a>
+                            <a class="nav-link <?php if ($current_page == $file_name) { echo 'active fw-bold'; } ?>" href="<?php echo $base . $file_name; ?>">
+                                <?php echo $menu_label; ?>
+                            </a>
                         </li>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-
+                    <?php } ?>
+                <?php } ?>
             </ul>
 
             <ul class="navbar-nav align-items-center">
-                <?php if($company): ?>
-
+                <?php if ($company) { ?>
+                    <!-- กระดิ่งแจ้งเตือน -->
                     <li class="nav-item me-2">
-                        <a class="nav-link" href="<?= $base ?>noti.php">
-                            🔔 <?php if($unread > 0): ?><span class="badge bg-danger rounded-pill"><?= $unread ?></span><?php endif; ?>
+                        <a class="nav-link" href="<?php echo $base; ?>noti.php">
+                            🔔 <?php if ($unread_count > 0) { ?>
+                                <span class="badge bg-danger rounded-pill"><?php echo $unread_count; ?></span>
+                            <?php } ?>
                         </a>
                     </li>
 
+                    <!-- เมนูโปรไฟล์ผู้ใช้ -->
                     <li class="nav-item dropdown">
                         <a class="nav-link dropdown-toggle text-white fw-bold" href="#" data-bs-toggle="dropdown">
-                            <?= $company['name'] ?>
-                            <?php if($is_admin): ?><span class="badge bg-warning text-dark ms-1">Admin</span><?php endif; ?>
+                            <?php echo htmlspecialchars($company['name']); ?>
+                            <?php if ($is_admin) { ?>
+                                <span class="badge bg-warning text-dark ms-1">Admin</span>
+                            <?php } ?>
                         </a>
                         <ul class="dropdown-menu dropdown-menu-end">
-                            <li><a class="dropdown-item" href="<?= $base ?>pass.php">เปลี่ยนรหัสผ่าน</a></li>
+                            <li><a class="dropdown-item" href="<?php echo $base; ?>pass.php">เปลี่ยนรหัสผ่าน</a></li>
                             <li><hr class="dropdown-divider"></li>
-                            <li><a class="dropdown-item text-danger" href="<?= $base ?>logout.php">ออกจากระบบ</a></li>
+                            <li><a class="dropdown-item text-danger" href="<?php echo $base; ?>logout.php">ออกจากระบบ</a></li>
                         </ul>
                     </li>
-
-                <?php endif; ?>
+                <?php } ?>
             </ul>
         </div>
     </div>

@@ -1,6 +1,10 @@
 <?php
-    $conn=mysqli_connect('localhost','root','','ecl2');
-    if(!$conn){
-        die ("เชื่อมต่อฐานช้อมูลล้มเหลว" .mysqli_error());
-    }
+// เชื่อมต่อฐานข้อมูล MySQL
+// กำหนดโฮสต์, บัญชีผู้ใช้, รหัสผ่าน และชื่อฐานข้อมูล
+$conn = mysqli_connect('localhost', 'root', '', 'ecl2');
+
+// ตรวจสอบว่าเชื่อมต่อฐานข้อมูลสำเร็จหรือไม่
+if (!$conn) {
+    die("เชื่อมต่อฐานข้อมูลล้มเหลว: " . mysqli_connect_error());
+}
 ?>
